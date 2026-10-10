@@ -108,6 +108,9 @@ jobs:
     env:
       TARGET_DIR: apps/desktop/.desktop-build/targets/mac-x64
       APP_PATH: apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts/mac/DeepSeek Harness.app
+      # Running the bundled Python inside the signed bundle would write __pycache__
+      # into it and invalidate the seal; never let it.
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Report runner
         run: |
@@ -189,6 +192,22 @@ jobs:
           fi
           echo "arch, signature and bundled runtime: ok"
 
+      - name: Clean interpreter residue and verify the shipped signature
+        run: |
+          # The packaged-runtime smoke runs the bundled Python inside the app bundle, and
+          # Python writes __pycache__ next to the modules it imports. Those files appear
+          # after signing and are not part of the seal, so an archive that contains them
+          # fails codesign --verify for whoever unpacks it. Drop them, then prove the
+          # bundle that actually ships still verifies.
+          find "$APP_PATH" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find "$APP_PATH" -name '*.pyc' -delete 2>/dev/null || true
+          if find "$APP_PATH" -name '*.pyc' | grep -q .; then
+            echo "::error::interpreter residue survived the cleanup"
+            exit 1
+          fi
+          codesign --verify --deep --strict "$APP_PATH"
+          echo "the bundle that ships verifies"
+
       - name: Create the distributable archives
         run: |
           VERSION=$(node -p "require('./apps/desktop/package.json').version")
@@ -201,6 +220,16 @@ jobs:
           DMG=$(ls "$TARGET_DIR"/unsigned-artifacts/*.dmg | head -1)
           cp "$DMG" "dist/${NAME}.dmg"
           ditto -c -k --keepParent "$APP_PATH" "dist/${NAME}.zip"
+
+          # The DMG is the primary download, so verify the bundle a recipient mounts.
+          MP=$(hdiutil attach -nobrowse -readonly "dist/${NAME}.dmg" | awk -F'\t' '/\/Volumes\//{print $NF; exit}')
+          if [ -z "$MP" ]; then
+            echo "::error::the dmg did not mount"
+            exit 1
+          fi
+          codesign --verify --deep --strict "$MP/DeepSeek Harness.app"
+          echo "dmg bundle verifies: $(codesign -dv "$MP/DeepSeek Harness.app" 2>&1 | sed -n 's/^CDHash=//p')"
+          hdiutil detach "$MP" >/dev/null
 
           ZIPSHA=$(shasum -a 256 "dist/${NAME}.zip" | awk '{print $1}')
           DMGSHA=$(shasum -a 256 "dist/${NAME}.dmg" | awk '{print $1}')
