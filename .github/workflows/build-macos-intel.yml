@@ -355,4 +355,15 @@ jobs:
           gh release upload "$TAG" \
             "dist/${NAME}.zip" "dist/${NAME}.dmg" README-zh-CN.txt "dist/SHA256SUMS.txt" \
             --clobber
+
+          # The dmg and zip names carry the built commit, so rebuilding a version adds a
+          # second pair instead of replacing the first. Keep only this build's files.
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[] | "\(.id) \(.name)"' \
+            | while read -r ID NAME_ON_RELEASE; do
+                case "$NAME_ON_RELEASE" in
+                  "${NAME}.zip"|"${NAME}.dmg"|README-zh-CN.txt|SHA256SUMS.txt) ;;
+                  *) echo "removing stale asset $NAME_ON_RELEASE"
+                     gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$ID" >/dev/null ;;
+                esac
+              done
           echo "release published: $(gh release view "$TAG" --json url --jq .url)"
