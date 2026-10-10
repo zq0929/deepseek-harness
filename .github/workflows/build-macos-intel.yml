@@ -285,10 +285,17 @@ jobs:
 
           打不开怎么办
           ------------
-          内网共享 / U 盘 / scp 传过去的文件没有 quarantine 标记，双击即可打开。
-          如果是从网盘、IM、邮件、AirDrop 拿到的，会带 quarantine 标记，需要先清掉：
+          只要是用浏览器下载的（包括从 GitHub 网页直接下载），macOS 都会打上 quarantine
+          标记，首次打开会被 Gatekeeper 拦下。内网共享 / U 盘 / scp 传过去的文件没有这个
+          标记，双击即可打开。
+          需要清掉时执行一次：
 
               xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"
+
+          想省掉这一步，可以用命令行下载（curl 不写这个标记）：
+
+              curl -L -o dsh.dmg "<Release 里 dmg 的下载链接>"
+              open dsh.dmg
 
           请不要用 sudo spctl --master-disable 关掉全局 Gatekeeper。
 
@@ -357,7 +364,7 @@ jobs:
 
           **安装**：下载 dmg → 拖入 Applications。
 
-          **首次打开**：从网盘 / IM / 邮件拿到的文件带 quarantine 标记，需要先执行：
+          **首次打开**：只要是用浏览器下载的（从 GitHub 网页直接下载也一样），macOS 都会加上 quarantine 标记，首次打开会被拦下。执行一次即可：
 
               xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"
 
