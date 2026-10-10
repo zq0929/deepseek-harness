@@ -228,8 +228,21 @@ jobs:
             exit 1
           fi
           codesign --verify --deep --strict "$MP/DeepSeek Harness.app"
-          echo "dmg bundle verifies: $(codesign -dv "$MP/DeepSeek Harness.app" 2>&1 | sed -n 's/^CDHash=//p')"
+          echo "dmg bundle verifies: CDHash $(codesign -dv --verbose=4 "$MP/DeepSeek Harness.app" 2>&1 | sed -n 's/^CDHash=//p')"
           hdiutil detach "$MP" >/dev/null
+
+          # Verify the ZIP the way a recipient experiences it: extract it fresh and check
+          # the bundle inside. A signature that only survives until the archive is written
+          # is exactly the defect this catches.
+          CHECK=$(mktemp -d)
+          ditto -x -k "dist/${NAME}.zip" "$CHECK"
+          if find "$CHECK/DeepSeek Harness.app" -name '*.pyc' | grep -q .; then
+            echo "::error::the zip contains Python bytecode residue"
+            exit 1
+          fi
+          codesign --verify --deep --strict "$CHECK/DeepSeek Harness.app"
+          rm -rf "$CHECK"
+          echo "zip verified after extraction"
 
           ZIPSHA=$(shasum -a 256 "dist/${NAME}.zip" | awk '{print $1}')
           DMGSHA=$(shasum -a 256 "dist/${NAME}.dmg" | awk '{print $1}')
