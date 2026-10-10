@@ -9,6 +9,10 @@
 #            (`package:mac:x64:unsigned`: ad-hoc signing, no certificate, no
 #            notarization, no .env.macos).
 #
+# Every successful build publishes (or updates) the GitHub Release for that version,
+# so the nightly run needs no manual step: the zip, the dmg and the instructions are
+# attached to the tag dsh-macos-x64-<version>.
+#
 # The sync job runs in the same workflow as the build on purpose: a push made with
 # the workflow's own GITHUB_TOKEN does not start other workflow runs, so a separate
 # "build on push" workflow would never fire.
@@ -26,15 +30,6 @@ on:
         description: Rebuild even when the fork already matches upstream
         type: boolean
         default: false
-      publish_release:
-        description: Create a GitHub Release containing the zip and dmg
-        type: boolean
-        default: false
-      release_tag:
-        description: Release tag to use (leave empty for dsh-macos-x64-<version>)
-        type: string
-        required: false
-        default: ''
   schedule:
     # 02:17 Beijing (18:17 UTC), off the hour because scheduled runs queue up then.
     - cron: '17 18 * * *'
@@ -307,6 +302,8 @@ jobs:
           ls -lh dist/
           echo "NAME=${NAME}" >> "$GITHUB_ENV"
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "ZIPSHA=${ZIPSHA}" >> "$GITHUB_ENV"
+          echo "DMGSHA=${DMGSHA}" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v7.0.1
         with:
@@ -315,20 +312,43 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish a GitHub Release
-        if: ${{ inputs.publish_release }}
+      - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          TAG="${RELEASE_TAG}"
-          if [ -z "$TAG" ]; then
-            TAG="dsh-macos-x64-${VERSION}"
+          TAG="dsh-macos-x64-${VERSION}"
+
+          # Alpha/beta/rc builds are marked as prereleases so GitHub keeps the newest
+          # stable release as "latest" instead of pointing it at an internal build.
+          PRERELEASE=""
+          case "$VERSION" in
+            *-*) PRERELEASE="--prerelease" ;;
+          esac
+
+          cat > release-notes.md <<EOF
+          内部构建（ad-hoc 签名，未公证），macOS Intel (x86_64)，版本 ${VERSION}。
+
+          **安装**：下载 dmg → 拖入 Applications。
+
+          **首次打开**：从网盘 / IM / 邮件拿到的文件带 quarantine 标记，需要先执行：
+
+              xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"
+
+          | 文件 | SHA-256 |
+          |---|---|
+          | ${NAME}.zip | ${ZIPSHA} |
+          | ${NAME}.dmg | ${DMGSHA} |
+
+          其余说明见附件 使用说明.txt。
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "DeepSeek Harness macOS Intel ${VERSION}" --notes-file release-notes.md
+          else
+            gh release create "$TAG" --title "DeepSeek Harness macOS Intel ${VERSION}" \
+              --notes-file release-notes.md $PRERELEASE
           fi
-          gh release view "$TAG" >/dev/null 2>&1 \
-            || gh release create "$TAG" \
-                 --title "DeepSeek Harness macOS Intel ${VERSION}" \
-                 --notes "内部构建（ad-hoc 签名，未公证）。下载后如无法打开，请执行：xattr -dr com.apple.quarantine \"/Applications/DeepSeek Harness.app\""
           gh release upload "$TAG" \
             "dist/${NAME}.zip" "dist/${NAME}.dmg" "dist/使用说明.txt" "dist/SHA256SUMS.txt" \
             --clobber
+          echo "release published: $(gh release view "$TAG" --json url --jq .url)"
