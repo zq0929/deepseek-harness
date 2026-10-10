@@ -161,7 +161,24 @@ jobs:
       # packaged-runtime smoke test against the finished application.
       - name: Package mac-x64 (unsigned)
         timeout-minutes: 180
-        run: pnpm run package:desktop:mac:x64:unsigned
+        run: |
+          # The packaged-runtime smoke converts real Office documents through LibreOffice.
+          # That normally takes 11-41 s but occasionally exceeds its 60 s conversion timeout
+          # on a loaded runner, so one retry keeps a slow runner from failing an otherwise
+          # good nightly build. Two clean failures still fail the job.
+          for ATTEMPT in 1 2; do
+            echo "::group::packaging attempt $ATTEMPT"
+            if pnpm run package:desktop:mac:x64:unsigned; then
+              echo "::endgroup::"
+              echo "packaging succeeded on attempt $ATTEMPT"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::packaging attempt $ATTEMPT failed"
+            sleep 10
+          done
+          echo "::error::packaging failed on both attempts"
+          exit 1
 
       - name: Verify the bundle
         run: |
