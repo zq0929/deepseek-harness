@@ -299,6 +299,10 @@ jobs:
           安装后不依赖任何构建目录，可随意移动。
           EOF
 
+          # GitHub replaces a non-ASCII release-asset name with "default.txt", so the
+          # release uploads this ASCII copy while the artifact keeps the Chinese name.
+          cp dist/使用说明.txt README-zh-CN.txt
+
           ls -lh dist/
           echo "NAME=${NAME}" >> "$GITHUB_ENV"
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
@@ -339,7 +343,7 @@ jobs:
           | ${NAME}.zip | ${ZIPSHA} |
           | ${NAME}.dmg | ${DMGSHA} |
 
-          其余说明见附件 使用说明.txt。
+          其余说明见附件 README-zh-CN.txt（使用说明）。
           EOF
 
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -349,6 +353,6 @@ jobs:
               --notes-file release-notes.md $PRERELEASE
           fi
           gh release upload "$TAG" \
-            "dist/${NAME}.zip" "dist/${NAME}.dmg" "dist/使用说明.txt" "dist/SHA256SUMS.txt" \
+            "dist/${NAME}.zip" "dist/${NAME}.dmg" README-zh-CN.txt "dist/SHA256SUMS.txt" \
             --clobber
           echo "release published: $(gh release view "$TAG" --json url --jq .url)"
