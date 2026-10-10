@@ -54,6 +54,7 @@ jobs:
     outputs:
       changed: ${{ steps.sync.outputs.changed }}
       head: ${{ steps.sync.outputs.head }}
+      upstream: ${{ steps.sync.outputs.upstream }}
     steps:
       - name: Fast-forward or merge from upstream
         id: sync
@@ -79,6 +80,7 @@ jobs:
           MERGE_TYPE=$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("merge_type", "none"))')
           echo "merge_type=$MERGE_TYPE"
           echo "head=$(gh api "repos/$GITHUB_REPOSITORY/commits/master" --jq .sha)" >> "$GITHUB_OUTPUT"
+          echo "upstream=$(gh api "repos/$UPSTREAM_REPOSITORY/commits/master" --jq '.sha[0:7]')" >> "$GITHUB_OUTPUT"
           case "$MERGE_TYPE" in
             fast-forward|merge)
               echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -100,6 +102,9 @@ jobs:
     if: ${{ needs.sync.outputs.changed == 'true' || inputs.force }}
     runs-on: macos-15-intel
     timeout-minutes: 240
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
+      release: ${{ steps.publish.outputs.release }}
     env:
       TARGET_DIR: apps/desktop/.desktop-build/targets/mac-x64
       APP_PATH: apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts/mac/DeepSeek Harness.app
@@ -317,6 +322,7 @@ jobs:
           retention-days: 30
 
       - name: Publish the GitHub Release
+        id: publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -367,3 +373,46 @@ jobs:
                 esac
               done
           echo "release published: $(gh release view "$TAG" --json url --jq .url)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release=$(gh release view "$TAG" --json url --jq .url)" >> "$GITHUB_OUTPUT"
+
+  notify:
+    name: Notify Feishu
+    needs: [sync, build]
+    # Runs even when the build was skipped or failed, because silence is the problem.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Send the result to the Feishu bot
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          SYNC_RESULT: ${{ needs.sync.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream }}
+          BUILT_VERSION: ${{ needs.build.outputs.version }}
+          RELEASE_URL: ${{ needs.build.outputs.release }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # A fork without the secret keeps working; the notification is not a build step.
+          if [ -z "${FEISHU_WEBHOOK:-}" ]; then
+            echo "::warning::FEISHU_WEBHOOK is not set; skipping the notification"
+            exit 0
+          fi
+
+          STAMP=$(TZ=Asia/Shanghai date "+%Y-%m-%d %H:%M")
+          if [ "$SYNC_RESULT" != "success" ]; then
+            TEXT=$(printf "%s\n" "❌ DeepSeek Harness macOS Intel：同步上游失败" "请查看日志：$RUN_URL")
+          elif [ "$BUILD_RESULT" = "skipped" ]; then
+            TEXT=$(printf "%s\n" "✅ DeepSeek Harness macOS Intel：上游无更新，本次未构建" "上游提交：$UPSTREAM_SHA" "时间：$STAMP")
+          elif [ "$BUILD_RESULT" = "success" ]; then
+            TEXT=$(printf "%s\n" "🚀 DeepSeek Harness macOS Intel 新版本已发布" "版本：${BUILT_VERSION:-未知}" "Release：${RELEASE_URL:-https://github.com/$GITHUB_REPOSITORY/releases}" "时间：$STAMP")
+          else
+            TEXT=$(printf "%s\n" "❌ DeepSeek Harness macOS Intel：构建失败（$BUILD_RESULT）" "日志：$RUN_URL" "时间：$STAMP")
+          fi
+
+          PAYLOAD=$(jq -n --arg text "$TEXT" '{msg_type:"text",content:{text:$text}}')
+          RESPONSE=$(curl -sS --max-time 20 -X POST "$FEISHU_WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD" 2>&1) || true
+          echo "feishu response: $RESPONSE"
+          printf "%s" "$RESPONSE" | jq -e ".code == 0 or .StatusCode == 0" >/dev/null \
+            || echo "::warning::the Feishu bot did not accept the message"
