@@ -1,16 +1,20 @@
-# Build a macOS Intel (x86_64) DeepSeek Harness desktop app on GitHub Actions.
+# Keep this fork's master in step with deepseek-ai/deepseek-harness and build a
+# macOS Intel (x86_64) desktop app whenever upstream moves.
 #
-# Upstream ships a first-class unsigned macOS build path (`package:mac:x64:unsigned`,
-# added in 0.2.1-alpha.2): ad-hoc signing, no Developer ID certificate, no notarization,
-# no .env.macos and no release credentials. This workflow drives exactly that path, so
-# it carries no patches of its own and survives upstream releases.
+# Two jobs:
+#   sync   - asks GitHub to fast-forward or merge the fork from upstream master,
+#            and reports whether anything changed.
+#   build  - runs only when something changed (or when forced), on the standard
+#            Intel runner, using upstream's own unsigned macOS path
+#            (`package:mac:x64:unsigned`: ad-hoc signing, no certificate, no
+#            notarization, no .env.macos).
 #
-# Runner: macos-15-intel is the standard Intel (x64) image; macos-26-intel is the
-# alternative. macos-latest / macos-15 / macos-26 are arm64 and cannot produce an
-# Intel build. Standard runners are free and unlimited on public repositories.
+# The sync job runs in the same workflow as the build on purpose: a push made with
+# the workflow's own GITHUB_TOKEN does not start other workflow runs, so a separate
+# "build on push" workflow would never fire.
 #
-# The application is ad-hoc signed, which Gatekeeper rejects for a quarantined
-# download. Recipients clear the attribute once:
+# The app is ad-hoc signed, which Gatekeeper rejects for a quarantined download.
+# Recipients clear the attribute once:
 #   xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"
 
 name: Build macOS Intel (x86_64)
@@ -18,6 +22,10 @@ name: Build macOS Intel (x86_64)
 on:
   workflow_dispatch:
     inputs:
+      force:
+        description: Rebuild even when the fork already matches upstream
+        type: boolean
+        default: false
       publish_release:
         description: Create a GitHub Release containing the zip and dmg
         type: boolean
@@ -27,24 +35,79 @@ on:
         type: string
         required: false
         default: ''
+  schedule:
+    # 02:17 Beijing (18:17 UTC), off the hour because scheduled runs queue up then.
+    - cron: '17 18 * * *'
 
-# Creating a Release needs write access; everything else only reads the repository.
+# The sync job merges upstream into master, and a release needs write access.
 permissions:
   contents: write
 
 env:
+  UPSTREAM_REPOSITORY: deepseek-ai/deepseek-harness
   DSH_TELEMETRY_DISABLED: '1'
-  TARGET_DIR: apps/desktop/.desktop-build/targets/mac-x64
-  APP_PATH: apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts/mac/DeepSeek Harness.app
 
 concurrency:
   group: build-macos-intel
   cancel-in-progress: false
 
 jobs:
+  sync:
+    name: Sync the fork with upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      head: ${{ steps.sync.outputs.head }}
+    steps:
+      - name: Fast-forward or merge from upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "fork master:     $(gh api "repos/$GITHUB_REPOSITORY/commits/master" --jq .sha)"
+          echo "upstream master: $(gh api "repos/$UPSTREAM_REPOSITORY/commits/master" --jq .sha)"
+
+          # The same operation as the "Sync fork" button: fast-forward when the fork
+          # is a strict ancestor of upstream, merge when the fork has its own commits.
+          set +e
+          RESPONSE=$(gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=master 2>&1)
+          STATUS=$?
+          set -e
+          printf '%s\n' "$RESPONSE"
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::the fork could not be synced from upstream (most likely a merge conflict); resolve it and re-run"
+            exit 1
+          fi
+
+          MERGE_TYPE=$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("merge_type", "none"))')
+          echo "merge_type=$MERGE_TYPE"
+          echo "head=$(gh api "repos/$GITHUB_REPOSITORY/commits/master" --jq .sha)" >> "$GITHUB_OUTPUT"
+          case "$MERGE_TYPE" in
+            fast-forward|merge)
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              echo "upstream moved; the fork now has it"
+              ;;
+            none)
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "the fork already matches upstream; no build needed"
+              ;;
+            *)
+              echo "::warning::unexpected merge_type $MERGE_TYPE"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
   build:
+    name: Build macOS Intel (x86_64)
+    needs: sync
+    if: ${{ needs.sync.outputs.changed == 'true' || inputs.force }}
     runs-on: macos-15-intel
     timeout-minutes: 240
+    env:
+      TARGET_DIR: apps/desktop/.desktop-build/targets/mac-x64
+      APP_PATH: apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts/mac/DeepSeek Harness.app
     steps:
       - name: Report runner
         run: |
@@ -52,10 +115,22 @@ jobs:
           uname -m
           df -h /
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
+          ref: master
           persist-credentials: false
-          fetch-depth: 1
+
+      - name: Refresh to the branch head the sync job produced
+        run: |
+          # A scheduled run carries the branch tip from before the sync job merged
+          # upstream, so check out the current head explicitly.
+          git fetch --depth 1 origin master
+          git checkout --detach FETCH_HEAD
+          echo "building $(git rev-parse --short HEAD): $(git log -1 --format=%s)"
+          if [ "$(git rev-parse HEAD)" != "${{ needs.sync.outputs.head }}" ]; then
+            echo "::warning::checked out a different commit than the sync job reported"
+          fi
+          node -p "'desktop version ' + require('./apps/desktop/package.json').version"
 
       - name: Free disk space
         run: |
@@ -67,9 +142,9 @@ jobs:
           rm -rf ~/Library/Caches/Homebrew ~/Library/Developer/Xcode/DerivedData 2>/dev/null || true
           df -h /
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5.0.0
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: '24'
           package-manager-cache: false
@@ -191,7 +266,7 @@ jobs:
           echo "NAME=${NAME}" >> "$GITHUB_ENV"
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: deepseek-harness-macos-x64
           path: dist/
