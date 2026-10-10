@@ -1,33 +1,17 @@
-# Build a macOS Intel (x86_64) DeepSeek Harness desktop app on GitHub Actions
-# WITHOUT an Apple Developer certificate.
+# Build a macOS Intel (x86_64) DeepSeek Harness desktop app on GitHub Actions.
 #
-# Why this workflow exists
-# ------------------------
-# The upstream packaging pipeline refuses unsigned macOS builds: it requires a
-# Developer ID certificate, a matching Team ID, a hardened runtime and notarization.
-# This workflow relaxes exactly those assertions (see "Apply the local build patches"),
-# signs the bundle with a throwaway self-signed certificate generated on the runner,
-# and publishes the .app as a zip + dmg. The result is fully self-contained and works
-# on another Mac after the recipient clears the quarantine attribute.
+# Upstream ships a first-class unsigned macOS build path (`package:mac:x64:unsigned`,
+# added in 0.2.1-alpha.2): ad-hoc signing, no Developer ID certificate, no notarization,
+# no .env.macos and no release credentials. This workflow drives exactly that path, so
+# it carries no patches of its own and survives upstream releases.
 #
-# Runner choice
-# -------------
-# macos-15-intel is the standard *Intel (x64)* macOS image; macos-26-intel is the
-# alternative. macos-latest / macos-15 / macos-26 are arm64 and cannot produce this
-# build through the upstream pipeline. Standard runners are free and unlimited on
-# public repositories; private repositories are billed at about $0.062/minute.
+# Runner: macos-15-intel is the standard Intel (x64) image; macos-26-intel is the
+# alternative. macos-latest / macos-15 / macos-26 are arm64 and cannot produce an
+# Intel build. Standard runners are free and unlimited on public repositories.
 #
-# Disk budget
-# -----------
-# A standard macOS runner advertises 14 GB of usable SSD and this build needs about
-# 9 GB, so the "Free disk space" step below reclaims simulator runtimes and caches.
-#
-# What to expect
-# --------------
-# The packaging command always ends by asking Apple to notarize, with placeholder
-# credentials, so it exits non-zero. The .app is complete before that step and its
-# runtime smoke test has already passed, so the workflow tolerates that one failure
-# and validates the bundle itself instead.
+# The application is ad-hoc signed, which Gatekeeper rejects for a quarantined
+# download. Recipients clear the attribute once:
+#   xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"
 
 name: Build macOS Intel (x86_64)
 
@@ -39,7 +23,7 @@ on:
         type: boolean
         default: false
       release_tag:
-        description: Release tag to use (leave empty for dsh-macos-x64-<version>-<sha>)
+        description: Release tag to use (leave empty for dsh-macos-x64-<version>)
         type: string
         required: false
         default: ''
@@ -50,8 +34,8 @@ permissions:
 
 env:
   DSH_TELEMETRY_DISABLED: '1'
-  APP_PATH: apps/desktop/.desktop-build/targets/mac-x64/artifacts/mac/DeepSeek Harness.app
-  SMOKE_MARKER: 'desktop runtime: DOCX, XLSX, PPTX to PDF and skill CLI discovery passed'
+  TARGET_DIR: apps/desktop/.desktop-build/targets/mac-x64
+  APP_PATH: apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts/mac/DeepSeek Harness.app
 
 concurrency:
   group: build-macos-intel
@@ -60,7 +44,7 @@ concurrency:
 jobs:
   build:
     runs-on: macos-15-intel
-    timeout-minutes: 300
+    timeout-minutes: 240
     steps:
       - name: Report runner
         run: |
@@ -75,8 +59,8 @@ jobs:
 
       - name: Free disk space
         run: |
-          # The image ships iOS simulator runtimes and Homebrew caches this build never
-          # touches, and the build tree needs roughly 9 GB of the 14 GB available.
+          # A standard macOS runner advertises 14 GB of usable SSD and this build needs
+          # roughly 10 GB, so reclaim the simulator runtimes and caches it never uses.
           sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* 2>/dev/null || true
           sudo rm -rf /Library/Developer/CoreSimulator/Caches/* 2>/dev/null || true
           rm -rf ~/Library/Developer/CoreSimulator/Caches/* 2>/dev/null || true
@@ -90,193 +74,24 @@ jobs:
           node-version: '24'
           package-manager-cache: false
 
-      # Runs before the (slow) install so a moved upstream anchor fails in seconds.
-      - name: Apply the local build patches
-        run: |
-          python3 - <<'PY'
-          import pathlib
-          import sys
-
-          MARKER = "LOCAL NON-APPLE BUILD PATCH"
-          SIG = "apps/desktop/scripts/verify-macos-signature.mjs"
-          CFG = "apps/desktop/scripts/electron-builder-config.mjs"
-
-          # (file, name, old, new). Applied by anchor string rather than by unified diff so
-          # the workflow fails loudly, instead of silently mis-patching, when upstream moves.
-          PATCHES = [
-              (
-                  SIG,
-                  "accept a signature without an Apple team identifier",
-                  "  const missing = [expectedAuthority, expectedTeam].filter(field => !fields.has(field))\n",
-                  "  // " + MARKER + ": a self-signed certificate carries no Apple-issued team\n"
-                  "  // identifier, so `codesign --display` prints \"TeamIdentifier=not set\". Accept that\n"
-                  "  // placeholder as satisfying the team assertion. Every other check (authority, secure\n"
-                  "  // timestamp, --verify --strict) is unchanged.\n"
-                  "  const teamSatisfied = fields.has(expectedTeam) || fields.has('TeamIdentifier=not set')\n"
-                  "  const missing = [expectedAuthority, ...(teamSatisfied ? [] : [expectedTeam])]\n"
-                  "    .filter(field => !fields.has(field))\n",
-              ),
-              (
-                  SIG,
-                  "drop the hardened-runtime assertion",
-                  "  if (!fields.some(line => /\\bflags=0x[0-9a-f]+\\(runtime\\)(?:\\s|$)/iu.test(line))) {\n"
-                  "    throw new Error('desktop macOS signing: runtime signature does not enable hardened runtime')\n"
-                  "  }\n",
-                  "  // " + MARKER + ": hardened runtime enables library validation, which cannot be\n"
-                  "  // satisfied without an Apple-issued team identifier, so local builds sign without\n"
-                  "  // `--options runtime`. The hardened-runtime assertion is intentionally omitted.\n",
-              ),
-              (
-                  SIG,
-                  "sign runtime code without --options runtime",
-                  "    '--identifier', identifier,\n"
-                  "    '--timestamp',\n"
-                  "    '--options', 'runtime',\n",
-                  "    '--identifier', identifier,\n"
-                  "    '--timestamp',\n"
-                  "    // " + MARKER + ": `--options runtime` removed because hardened runtime enables\n"
-                  "    // library validation, which needs an Apple team identifier.\n",
-              ),
-              (
-                  CFG,
-                  "disable hardened runtime for the packed app",
-                  "      forceCodeSigning: true,\n      hardenedRuntime: true,\n",
-                  "      forceCodeSigning: true,\n"
-                  "      // " + MARKER + ": hardened runtime disabled, see verify-macos-signature.mjs.\n"
-                  "      hardenedRuntime: false,\n",
-              ),
-          ]
-
-          def main() -> int:
-              pending = []
-              for rel, name, old, new in PATCHES:
-                  path = pathlib.Path(rel)
-                  text = path.read_text(encoding="utf-8")
-                  if new in text:
-                      print(f"already applied: {rel}: {name}")
-                      continue
-                  if old not in text:
-                      print(f"ERROR: anchor not found in {rel}: {name}", file=sys.stderr)
-                      print("       Upstream changed the packaging scripts; re-derive this patch by hand.", file=sys.stderr)
-                      return 1
-                  if text.count(old) != 1:
-                      print(f"ERROR: anchor is ambiguous ({text.count(old)}x) in {rel}: {name}", file=sys.stderr)
-                      return 1
-                  pending.append((path, old, new, name))
-              for path, old, new, name in pending:
-                  text = path.read_text(encoding="utf-8")
-                  path.write_text(text.replace(old, new, 1), encoding="utf-8")
-                  print(f"patched: {path.name}: {name}")
-              if not pending:
-                  print("all patches already applied")
-              return 0
-
-          raise SystemExit(main())
-          PY
-
-      - name: Create and trust a self-signed signing certificate
-        run: |
-          # A certificate must carry the Code Signing extended key usage to appear in
-          # `security find-identity -p codesigning`. The harness prefixes the configured
-          # identity with "Developer ID Application: ", so the common name below has to
-          # keep that prefix while .env.macos must not (the pipeline rejects the prefix).
-          CERT_DIR="$RUNNER_TEMP/local-signing"
-          mkdir -p "$CERT_DIR"
-          cat > "$CERT_DIR/openssl.cnf" <<'EOF'
-          [req]
-          distinguished_name = dn
-          prompt = no
-          [dn]
-          CN = Developer ID Application: DSH Local Build (LOCAL00001)
-          O = DSH Local Build
-          [v3]
-          basicConstraints = critical,CA:FALSE
-          keyUsage = critical,digitalSignature
-          extendedKeyUsage = codeSigning
-          subjectKeyIdentifier = hash
-          EOF
-          openssl req -x509 -sha256 -newkey rsa:2048 -nodes -days 365 \
-            -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
-            -config "$CERT_DIR/openssl.cnf" -extensions v3
-          openssl pkcs12 -export -inkey "$CERT_DIR/key.pem" -in "$CERT_DIR/cert.pem" \
-            -out "$CERT_DIR/dsh-local.p12" -passout pass:dshlocal
-          # Trust settings are what make `find-identity -v` (valid identities only) succeed;
-          # the admin domain plus System keychain is the only non-interactive location.
-          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$CERT_DIR/cert.pem"
-
-          # Fail fast, before the ~90 minute build, if the p12 cannot be imported or the
-          # identity is not considered valid. Mirrors the lookup the packaging pipeline does.
-          security create-keychain -p dshverify "$RUNNER_TEMP/verify.keychain-db"
-          security unlock-keychain -p dshverify "$RUNNER_TEMP/verify.keychain-db"
-          security import "$CERT_DIR/dsh-local.p12" -k "$RUNNER_TEMP/verify.keychain-db" \
-            -P dshlocal -T /usr/bin/codesign >/dev/null
-          security set-key-partition-list -S apple-tool:,apple: -s -k dshverify \
-            "$RUNNER_TEMP/verify.keychain-db" >/dev/null
-          FOUND=$(security find-identity -v -p codesigning "$RUNNER_TEMP/verify.keychain-db" \
-            | grep -cF "DSH Local Build (LOCAL00001)" || true)
-          security delete-keychain "$RUNNER_TEMP/verify.keychain-db"
-          if [ "$FOUND" -lt 1 ]; then
-            echo "::error::the generated certificate is not a valid code-signing identity; is the trust step allowed on this runner?"
-            security find-identity -p codesigning || true
-            exit 1
-          fi
-          echo "signing identity is valid: DSH Local Build (LOCAL00001)"
-
-      - name: Write apps/desktop/.env.macos
-        run: |
-          # Internal build settings. Every URL below is a placeholder that never resolves,
-          # so the packaged app fails closed on update checks. The only real value is the
-          # signing material generated in the previous step; no secrets are involved.
-          CERT_DIR="$RUNNER_TEMP/local-signing"
-          printf '%s\n' 'dummy placeholder (not a real App Store Connect API key)' > "$CERT_DIR/notary-dummy.txt"
-          cat > apps/desktop/.env.macos <<EOF
-          DSH_DESKTOP_APP_ID=com.deepseek.harness
-          DSH_DESKTOP_AUTO_UPDATE_ENV=test
-          DOWNLOAD_TEST_ORIGIN=https://download.example.invalid
-          DOWNLOAD_TEST_RELEASE_ID=$(openssl rand -hex 16)
-          DSH_DESKTOP_MACOS_PACK_CONCURRENCY=4
-          DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://update.example.invalid
-          DSH_DESKTOP_MANDATORY_UPDATE_CONFIG='{"allowedAuthOrigins":["https://login.example.invalid"]}'
-          DSH_DESKTOP_MACOS_SIGNING_IDENTITY=DSH Local Build (LOCAL00001)
-          DSH_DESKTOP_MACOS_TEAM_ID=LOCAL00001
-          CSC_LINK=$CERT_DIR/dsh-local.p12
-          CSC_KEY_PASSWORD=dshlocal
-          APPLE_API_KEY=$CERT_DIR/notary-dummy.txt
-          APPLE_API_KEY_ID=DUMMYKEYID
-          APPLE_API_ISSUER=00000000-0000-0000-0000-000000000000
-          EOF
-          # Uncomment to pull the bundled dsh runtime through a mirror:
-          # DSH_DESKTOP_NPM_REGISTRY=https://registry.npmmirror.com
-          sed -n '1,20p' apps/desktop/.env.macos
-
       - name: Install workspace dependencies
         timeout-minutes: 60
         run: pnpm install --frozen-lockfile
 
-      - name: Package mac-x64
-        timeout-minutes: 200
-        run: |
-          # The pipeline ends with Apple notarization, which must fail here because the
-          # credentials above are placeholders. The bundle is complete by then.
-          set +e
-          pnpm run package:desktop:mac:x64:dir > "$RUNNER_TEMP/package.log" 2>&1
-          PKG_EXIT=$?
-          set -e
-          echo "packaging exit: $PKG_EXIT (a failure at the notarization step is expected)"
-          tail -n 40 "$RUNNER_TEMP/package.log"
-
-          if [ ! -d "$APP_PATH" ]; then
-            echo "::error::no application bundle was produced; see the packaging log above"
-            exit 1
-          fi
-          if ! grep -qF "$SMOKE_MARKER" "$RUNNER_TEMP/package.log"; then
-            echo "::error::the packaged runtime smoke test did not pass"
-            exit 1
-          fi
-          echo "application bundle produced and runtime smoke passed"
+      # The unsigned path takes no release settings, so it needs no dotenv file and no
+      # signing material. It ad-hoc signs the bundle, skips notarization, and runs the
+      # packaged-runtime smoke test against the finished application.
+      - name: Package mac-x64 (unsigned)
+        timeout-minutes: 180
+        run: pnpm run package:desktop:mac:x64:unsigned
 
       - name: Verify the bundle
         run: |
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::no application bundle was produced"
+            exit 1
+          fi
+
           # These are exactly the properties that decide whether the archive works on
           # somebody else's Mac.
           if ! file "$APP_PATH/Contents/MacOS/DeepSeek Harness" | grep -q x86_64; then
@@ -284,58 +99,33 @@ jobs:
             exit 1
           fi
           codesign --verify --deep --strict "$APP_PATH"
+          codesign -dv --verbose=4 "$APP_PATH" 2>&1 | grep -E '^(Identifier|Format|Signature|TeamIdentifier)' || true
 
-          # Hardened runtime enables library validation, which a self-signed certificate
-          # without an Apple Team ID cannot satisfy; the bundled Node and Python would
-          # then fail to load their own libraries on the target machine.
-          hardened_flags() {
-            codesign -dv --verbose=4 "$1" 2>&1 \
-              | sed -n 's/^CodeDirectory.*flags=0x[0-9a-f]*(\(.*\)).*$/\1/p' | head -1
-          }
-          for rel in \
-            "Contents/MacOS/DeepSeek Harness" \
-            "Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node" \
-            "Contents/Resources/runtime/primary-runtime/dependencies/python/bin/python3"; do
-            file "$APP_PATH/$rel" | grep -q x86_64 || {
-              echo "::error::$rel is not x86_64"; exit 1
-            }
-            flags=$(hardened_flags "$APP_PATH/$rel")
-            case ",$flags," in
-              *,runtime,*)
-                echo "::error::$rel is signed with hardened runtime; the local patches did not take effect"
-                exit 1
-                ;;
-            esac
-          done
+          # The decisive test: both bundled interpreters must actually start under this
+          # signature, which is what fails when a bundle's code signing is wrong.
+          "$APP_PATH/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node" -e \
+            "console.log('bundled node', process.version, process.arch)"
+          "$APP_PATH/Contents/Resources/runtime/primary-runtime/dependencies/python/bin/python3" -c \
+            "import sys; print('bundled python', sys.version.split()[0])"
 
           if xattr -p com.apple.quarantine "$APP_PATH" >/dev/null 2>&1; then
             echo "::error::the built app carries a quarantine attribute"
             exit 1
           fi
-
-          "$APP_PATH/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node" -e \
-            "console.log('bundled node', process.version, process.arch)"
-          "$APP_PATH/Contents/Resources/runtime/primary-runtime/dependencies/python/bin/python3" -c \
-            "import sys; print('bundled python', sys.version.split()[0])"
-          echo "arch, signature, no hardened runtime, no quarantine: ok"
+          echo "arch, signature and bundled runtime: ok"
 
       - name: Create the distributable archives
-        id: archive
         run: |
           VERSION=$(node -p "require('./apps/desktop/package.json').version")
           SHA=$(git rev-parse --short HEAD)
           NAME="deepseek-harness-${VERSION}-${SHA}-macos-x64"
           mkdir -p dist
 
+          # electron-builder already produced a DMG (with the Applications symlink);
+          # give it this workflow's naming, then add a ditto-made zip beside it.
+          DMG=$(ls "$TARGET_DIR"/unsigned-artifacts/*.dmg | head -1)
+          cp "$DMG" "dist/${NAME}.dmg"
           ditto -c -k --keepParent "$APP_PATH" "dist/${NAME}.zip"
-
-          STAGE=$(mktemp -d)/root
-          mkdir -p "$STAGE"
-          ditto "$APP_PATH" "$STAGE/DeepSeek Harness.app"
-          ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname "DeepSeek Harness" -srcfolder "$STAGE" -ov -format UDZO \
-            "dist/${NAME}.dmg" >/dev/null
-          rm -rf "$(dirname "$STAGE")"
 
           ZIPSHA=$(shasum -a 256 "dist/${NAME}.zip" | awk '{print $1}')
           DMGSHA=$(shasum -a 256 "dist/${NAME}.dmg" | awk '{print $1}')
@@ -351,7 +141,7 @@ jobs:
           系统要求 macOS 13.0 (Ventura) 或更高
 
           上游：https://github.com/deepseek-ai/deepseek-harness  （MIT）
-          这是内部构建，非官方发布产物，没有 Apple 签名也没有公证。
+          这是内部构建，非官方发布产物，没有 Apple 开发者签名也没有公证。
 
           安装
           ----
@@ -374,7 +164,7 @@ jobs:
 
           已知限制
           --------
-          1. 检查更新会失败：更新地址是占位符，不会自动更新。升级请换用新的包。
+          1. 检查更新会失败：内部构建不带更新源，不会自动更新。升级请换用新的包。
           2. 账号登录未接通（上游 developer preview 状态），请在设置里填 DeepSeek API Key。
           3. 与 CLI 版共享 ~/.dsh 下的会话和设置。
           4. developer preview，profile 数据不保证跨版本兼容。
@@ -421,7 +211,7 @@ jobs:
           gh release view "$TAG" >/dev/null 2>&1 \
             || gh release create "$TAG" \
                  --title "DeepSeek Harness macOS Intel ${VERSION}" \
-                 --notes "内部构建（自签名，未公证）。下载后如无法打开，请执行：xattr -dr com.apple.quarantine \"/Applications/DeepSeek Harness.app\""
+                 --notes "内部构建（ad-hoc 签名，未公证）。下载后如无法打开，请执行：xattr -dr com.apple.quarantine \"/Applications/DeepSeek Harness.app\""
           gh release upload "$TAG" \
             "dist/${NAME}.zip" "dist/${NAME}.dmg" "dist/使用说明.txt" "dist/SHA256SUMS.txt" \
             --clobber
